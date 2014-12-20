@@ -11,10 +11,10 @@ A simple tool to get a weather forecast for a (UK) journey. Uses the Google Maps
     # source bin/activate
     # pip install -r requirements.txt
 
-* Create MySQL database and import weather.sql
-* Update travel_weather.py with database config and Met Office API key
+ * Create MySQL database and import weather.sql
+ * Update travel_weather.py with database config and Met Office API key
 
-    # ./travel_weather.py
+`  # ./travel_weather.py`
 
 ## Sample Usage
 
