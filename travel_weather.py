@@ -1,19 +1,35 @@
 #!/usr/bin/env python2
+"""Calculate weather along a driven route in the UK.
 
-import requests
-from urllib import urlencode
+Makes use of the Google Maps Directions API, and the Met Office DataPoint API.
+"""
+
+import collections
+import datetime
+import urllib
+
 import MySQLdb
-from MySQLdb.cursors import DictCursor
-from datetime import datetime, timedelta
+import requests
+from MySQLdb import cursors
 
-API_KEY = '' # Get from http://www.metoffice.gov.uk/datapoint/API
+class TravelWeatherException(Exception):
+    """General case parent exception for this script."""
+
+class FailedGoogleApiException(TravelWeatherException):
+    """Exception for when calls to the Google Maps Directions API fail."""
+
+class FailedMetOfficeApiException(TravelWeatherException):
+    """Exception for when calls to the Met Office API fail."""
+
+# Get from http://www.metoffice.gov.uk/datapoint/API
+API_KEY = ''
 
 DB = MySQLdb.connect(
     host='',
     user='',
     passwd='',
     db='',
-    cursorclass=DictCursor
+    cursorclass=cursors.DictCursor
 )
 
 VISIBILITIES = {
@@ -63,18 +79,67 @@ WEATHERS = {
 
 CURSOR = DB.cursor()
 
-def main():
-    start = raw_input('Enter Starting Address: ')
-    dest = raw_input('Enter Destination Address: ')
-    starttime = datetime.strptime(
-        raw_input('Enter Departure Date/Time (YYYY-MM-DD HH:MM): '),
-        '%Y-%m-%d %H:%M'
-    )
+WEATHER_STATION_SQL = (
+    "SELECT "
+    "    id, name, latitude, longitude, directions_lat, directions_long, time, "
+    "    ("
+    "        6378.10 * "
+    "        ACOS("
+    "            ("
+    "                COS(RADIANS(directions_lat)) * "
+    "                COS(RADIANS(latitude)) * "
+    "                COS(RADIANS(directions_long) - RADIANS(longitude))"
+    "            ) + ("
+    "                SIN(RADIANS(directions_lat)) * "
+    "                SIN(RADIANS(latitude))"
+    "            )"
+    "        )"
+    "    ) AS distance_in_km "
+    "FROM locations "
+    "JOIN ("
+    "    SELECT "
+    "        {point.latitude} AS directions_lat,"
+    "        {point.longitude} AS directions_long, "
+    "        {point.time} AS time"
+    ") AS p "
+    "ORDER BY distance_in_km "
+    "LIMIT 1"
+)
 
-    query = urlencode(
+_Point = collections.namedtuple("Point", ["latitude", "longitude", "time"])
+
+class Point(_Point):
+    """Type for storing points on a route to get weather information for.
+
+    Attributes:
+        latitude (float): Interpolated latitude of the point
+        longitude (float): Interpolated longitude of the point
+        time (int): Time in minutes since start of journey
+    """
+
+_WeatherStation = collections.namedtuple("WeatherStation",
+                                         ["station_id", "name", "time"])
+
+class WeatherStation(_WeatherStation):
+    """Type for storing the nearest weather station to the points on the route
+
+    Attributes:
+        station_id (string): The Met Office ID for this station
+        name (string): The name of the station
+        time (int): Time in minutes since start of journey
+    """
+
+def get_directions(origin, destination):
+    """Retrieves directions from origin to destination.
+
+    Args:
+        origin (str): Starting point of the route
+        destination (str): Ending point of the route
+    """
+    query = urllib.urlencode(
         {
-            'origin': start,
-            'destination': dest,
+            'origin': origin,
+            'destination': destination,
             'sensor': 'false',
             'region': 'uk'
         }
@@ -82,163 +147,224 @@ def main():
 
     url = 'http://maps.googleapis.com/maps/api/directions/json?' + query
 
-    r = requests.get(url)
+    response = requests.get(url)
 
-    if r.status_code == 200:
-        j = r.json()
+    if response.status_code == 200:
+        return response.json()
 
-        time = 0
-        points = [
-            (
-                j['routes'][0]['legs'][0]['start_location']['lat'],
-                j['routes'][0]['legs'][0]['start_location']['lng'],
-                0
+    raise FailedGoogleApiException(
+        "Could not retrieve directions: status {0}".format(response.status_code)
+    )
+
+def get_half_hourly_points(directions):
+    """Get interpolated points at each half-hour along the route.
+
+    Args:
+        directions (dict): Parsed JSON response from the Google Maps API
+
+    Yields:
+        a Point object for each point along the route
+    """
+    yield Point(
+        latitude=directions['routes'][0]['legs'][0]['start_location']['lat'],
+        longitude=directions['routes'][0]['legs'][0]['start_location']['lng'],
+        time=0
+    )
+
+    time = 0
+    point_time = 30
+
+    for step in directions['routes'][0]['legs'][0]['steps']:
+        duration = step['duration']['value']
+        jumpcount = 1
+
+        while (time + duration) > 1800:
+            ratio = (
+                (
+                    (
+                        jumpcount *
+                        1800
+                    ) -
+                    time
+                ) /
+                float(step['duration']['value'])
             )
-        ]
-        point_time = 30
 
-        for step in j['routes'][0]['legs'][0]['steps']:
-            duration = step['duration']['value']
-            jumpcount = 1
-
-            while (time + duration) > 1800:
-                ratio = (
+            latitude = (
+                step['start_location']['lat'] +
+                (
+                    ratio *
                     (
-                        (
-                            jumpcount *
-                            1800
-                        ) -
-                        time
-                    ) /
-                    float(step['duration']['value'])
-                )
-
-                latitude = (
-                    step['start_location']['lat'] +
-                    (
-                        ratio *
-                        (
-                            step['end_location']['lat'] -
-                            step['start_location']['lat']
-                        )
+                        step['end_location']['lat'] -
+                        step['start_location']['lat']
                     )
                 )
+            )
 
-                longitude = (
-                    step['start_location']['lng'] +
+            longitude = (
+                step['start_location']['lng'] +
+                (
+                    ratio *
                     (
-                        ratio *
-                        (
-                            step['end_location']['lng'] -
-                            step['start_location']['lng']
-                        )
+                        step['end_location']['lng'] -
+                        step['start_location']['lng']
                     )
                 )
-
-                points.append((latitude,longitude,point_time))
-
-                duration = duration - 1800
-                jumpcount = jumpcount + 1
-                point_time = point_time + 30
-
-            time = (time + duration) % 1800
-
-        points.append(
-            (
-                j['routes'][0]['legs'][0]['end_location']['lat'],
-                j['routes'][0]['legs'][0]['end_location']['lng'],
-                j['routes'][0]['legs'][0]['duration']['value'] / 60
             )
+
+            yield Point(
+                latitude=latitude,
+                longitude=longitude,
+                time=point_time
+            )
+
+            duration = duration - 1800
+            jumpcount = jumpcount + 1
+            point_time = point_time + 30
+
+        time = (time + duration) % 1800
+
+    final_time = directions['routes'][0]['legs'][0]['duration']['value'] / 60
+
+    if final_time % 30 != 0:
+        yield Point(
+            latitude=directions['routes'][0]['legs'][0]['end_location']['lat'],
+            longitude=directions['routes'][0]['legs'][0]['end_location']['lng'],
+            time=final_time
         )
 
-        sql = (
-            "SELECT id, name, latitude, longitude, directions_lat, directions_long, time, "
-            "    (6378.10 * ACOS(COS(RADIANS(directions_lat)) "
-            "                * COS(RADIANS(latitude)) "
-            "                * COS(RADIANS(directions_long) - RADIANS(longitude)) "
-            "                + SIN(RADIANS(directions_lat)) "
-            "                * SIN(RADIANS(latitude)))) AS distance_in_km "
-            "FROM locations "
-            "JOIN ( "
-            "    SELECT {0} AS directions_lat, {1} AS directions_long, {2} AS time "
-            "  ) AS p "
-            "ORDER BY distance_in_km "
-            "LIMIT 1"
+def get_weather_stations(directions):
+    """Determines the nearest weather station to each point along the route.
+
+    Points are calculated at every half an hour, and interpolated between the
+    endpoints of each leg.
+
+    Args:
+        directions (dict): Parsed JSON response from the Google Maps API
+
+    Yields:
+        a WeatherStation object for each point along the route
+    """
+    for point in get_half_hourly_points(directions):
+        CURSOR.execute(WEATHER_STATION_SQL.format(point=point))
+
+        station = CURSOR.fetchone()
+
+        yield WeatherStation(station_id=station["id"],
+                             name=station["name"],
+                             time=station["time"])
+
+def get_forecast(station, time):
+    """Retrieves the forecast for the given station at the given time.
+
+    Args:
+        station (WeatherStation): The station to retrieve the forecast for
+        time (datetime.datetime): The time to retrieve the forecast for. This
+            must have 0 values for the minutes, seconds and microseconds, and
+            the hour value must be a multiple of 3
+
+    Returns:
+        (dict) A dictionary of forecast data as per the API specification
+    """
+    query = urllib.urlencode(
+        {
+            'res': '3hourly',
+            'time': time.strftime('%Y-%m-%dT%HZ'),
+            'key': API_KEY
+        }
+    )
+
+    url = (
+        'http://datapoint.metoffice.gov.uk/public/data/val/wxfcs'
+        '/all/json/{0}?{1}'
+    ).format(
+        station.station_id,
+        query
+    )
+
+    response = requests.get(url)
+
+    if response.status_code == 200:
+        return response.json()['SiteRep']['DV']['Location']['Period']['Rep']
+
+    raise FailedMetOfficeApiException(
+        "Could not get forecast: status {0}".format(response.status_code)
+    )
+
+def print_forecast(station, time):
+    """Print out a forecast for the given station at the given time.
+
+    Normalises the time to fit the standard needed for the API, retrieves the
+    forecast and prints a neat representation.
+
+    Args:
+        station (WeatherStation): The station to retrieve the forecast for
+        time (datetime.datetime): The time to retrieve the forecast for.
+    """
+    try:
+        forecasttime = datetime.datetime(
+            time.year,
+            time.month,
+            time.day,
+            (time.hour / 3) * 3
         )
 
-        for index, point in enumerate(points):
-            CURSOR.execute(sql.format(*point))
+        forecast = get_forecast(station, forecasttime)
 
-            location = CURSOR.fetchone()
+        forecastendtime = forecasttime + datetime.timedelta(minutes=180)
 
-            realtime = starttime + timedelta(minutes=location['time'])
+        print (
+            'Forecast for time {0}-{1} : {2}\n'
+            '    Temperature {3} celsius (feels like {4} celsius)\n'
+            '    Wind {5}mph from {6}, gusting {7}mph\n'
+            '    Precipitation: {8}% probability\n'
+            '    Humidity: {9}%\n'
+            '    Visibility: {10}\n'
+            '    UV Index: {11}'
+        ).format(
+            forecasttime.strftime('%H%p'),
+            forecastendtime.strftime('%H%p'),
+            WEATHERS[forecast['W']],
+            forecast['T'],
+            forecast['F'],
+            forecast['S'],
+            forecast['D'],
+            forecast['G'],
+            forecast['Pp'],
+            forecast['H'],
+            VISIBILITIES[forecast['V']],
+            forecast['U']
+        )
+    except FailedMetOfficeApiException as exception:
+        print "No Forecast Available ({0})".format(exception)
 
-            print ''
+def main():
+    """Do all the work."""
+    origin = raw_input('Enter Starting Address: ')
+    destination = raw_input('Enter Destination Address: ')
+    starttime = datetime.datetime.strptime(
+        raw_input('Enter Departure Date/Time (YYYY-MM-DD HH:MM): '),
+        '%Y-%m-%d %H:%M'
+    )
 
-            print 'Point {0}, Weather Station {1}, Time {2} ({3}hr{4})'.format(
-                index + 1,
-                location['name'],
-                realtime.strftime('%H:%M'),
-                location['time'] / 60,
-                location['time'] % 60
-            )
+    directions = get_directions(origin, destination)
 
-            forecasttime = datetime(
-                realtime.year,
-                realtime.month,
-                realtime.day,
-                (realtime.hour / 3) * 3
-            )
+    for index, station in enumerate(get_weather_stations(directions)):
+        time = starttime + datetime.timedelta(minutes=station.time)
 
-            forecastendtime = forecasttime + timedelta(minutes=180)
+        print ''
 
-            query = urlencode(
-                {
-                    'res': '3hourly',
-                    'time': forecasttime.strftime('%Y-%m-%dT%HZ'),
-                    'key': API_KEY
-                }
-            )
+        print 'Point {0}, Weather Station {1}, Time {2} ({3}hr{4})'.format(
+            index + 1,
+            station.name,
+            time.strftime('%H:%M'),
+            station.time / 60,
+            station.time % 60
+        )
 
-            url = (
-                'http://datapoint.metoffice.gov.uk/public/data/val/wxfcs'
-                '/all/json/{0}?{1}'
-            ).format(
-                location['id'],
-                query
-            )
+        print_forecast(station, time)
 
-            r = requests.get(url)
-
-            if r.status_code == 200:
-                forecast = r.json()['SiteRep']['DV']['Location']['Period']['Rep']
-
-                print (
-                    'Forecast for time {0}-{1} : {2}\n'
-                    '    Temperature {3} celsius (feels like {4} celsius)\n'
-                    '    Wind {5}mph from {6}, gusting {7}mph\n'
-                    '    Precipitation: {8}% probability\n'
-                    '    Humidity: {9}%\n'
-                    '    Visibility: {10}\n'
-                    '    UV Index: {11}'
-                ).format(
-                    forecasttime.strftime('%H%p'),
-                    forecastendtime.strftime('%H%p'),
-                    WEATHERS[forecast['W']],
-                    forecast['T'],
-                    forecast['F'],
-                    forecast['S'],
-                    forecast['D'],
-                    forecast['G'],
-                    forecast['Pp'],
-                    forecast['H'],
-                    VISIBILITIES[forecast['V']],
-                    forecast['U']
-                )
-            else:
-                print 'No Forecast Available.'
-
-            print ''
+        print ''
 
 if __name__ == '__main__':
     main()
